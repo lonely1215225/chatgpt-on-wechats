@@ -9,9 +9,13 @@ import json
 import os
 import threading
 import time
+from collections import OrderedDict
 
 import requests
+from DrissionPage._configs.chromium_options import ChromiumOptions
+from DrissionPage._pages.chromium_page import ChromiumPage
 
+from bridge.bridge import Bridge
 from bridge.context import *
 from bridge.reply import *
 from channel.chat_channel import ChatChannel
@@ -103,6 +107,23 @@ def qrCallback(uuid, status, qrcode):
         qr.print_ascii(invert=True)
 
 
+class LRUCache(OrderedDict):
+    def __init__(self, maxsize=1000):
+        super().__init__()
+        self.maxsize = maxsize
+
+    def add(self, item):
+        if item in self:
+            self.move_to_end(item)
+        self[item] = True
+        if len(self) > self.maxsize:
+            oldest = next(iter(self))
+            del self[oldest]
+
+
+seen_hrefs = LRUCache(maxsize=1000)  # 设置最大缓存大小为1000
+
+
 @singleton
 class WechatChannel(ChatChannel):
     NOT_SUPPORT_REPLYTYPE = []
@@ -111,6 +132,7 @@ class WechatChannel(ChatChannel):
         super().__init__()
         self.receivedMsgs = ExpiredDict(60 * 60)
         self.auto_login_times = 0
+        self.loop_event = threading.Event()
 
     def startup(self):
         try:
@@ -193,7 +215,8 @@ class WechatChannel(ChatChannel):
             logger.debug("[WX]receive voice for group msg: {}".format(cmsg.content))
         elif cmsg.ctype == ContextType.IMAGE:
             logger.debug("[WX]receive image for group msg: {}".format(cmsg.content))
-        elif cmsg.ctype in [ContextType.JOIN_GROUP, ContextType.PATPAT, ContextType.ACCEPT_FRIEND, ContextType.EXIT_GROUP]:
+        elif cmsg.ctype in [ContextType.JOIN_GROUP, ContextType.PATPAT, ContextType.ACCEPT_FRIEND,
+                            ContextType.EXIT_GROUP]:
             logger.debug("[WX]receive note msg: {}".format(cmsg.content))
         elif cmsg.ctype == ContextType.TEXT:
             # logger.debug("[WX]receive group msg: {}, cmsg={}".format(json.dumps(cmsg._rawmsg, ensure_ascii=False), cmsg))
@@ -206,11 +229,150 @@ class WechatChannel(ChatChannel):
         if context:
             self.produce(context)
 
+    def process_follower_num(self, follower_num):
+        if follower_num is None:
+            return True  # 继续循环
+
+        # 使用正则表达式提取数字
+        numbers = re.findall(r'\d+', follower_num.replace(',', ''))
+        if not numbers:
+            return True  # 如果没有找到数字，继续循环
+
+        # 将提取的数字（可能有多段）合并后转换为整数
+        number = int(''.join(numbers))
+
+        # 比较数字，如果小于5000则返回True
+        return number < 1000
+
+    def start_sending(self, message, receiver):
+        co = ChromiumOptions()
+        co.headless(True)
+        # co = co.set_argument('--no-sandbox')  # 解决$DISPLAY报错
+        page = ChromiumPage(addr_driver_opts=co)
+
+        # 使用格式化字符串构造URL
+        url = f'https://twitter.com/search?f=live&q={message}%20-filter%3Areplies&src=typed_query'
+        page.get(url)
+
+        page.wait.load_start()
+        page.set.scroll.smooth()
+        register_lab = page.ele('xpath://*[@id="modal-header"]/span/span')
+        print(register_lab)
+        if register_lab and register_lab.raw_text == '注册 X':
+            page.ele(
+                'xpath://*[@id="layers"]/div/div/div/div/div/div/div[2]/div[2]/div/div/div[2]/div[2]/div/div/div/div[4]').input(
+                "")
+
+            time.sleep(1)
+            next_button = page.ele(
+                'xpath://*[@id="layers"]/div/div/div/div/div/div/div[2]/div[2]/div/div/div[2]/div[2]/div/div/div/button[2]')
+            next_button.wait.clickable()
+            next_button.click()
+            page.ele(
+                'xpath://*[@id="layers"]/div/div/div/div/div/div/div[2]/div[2]/div/div/div[2]/div[2]/div[1]/div/div/div[3]').input(
+                "")
+
+            time.sleep(1)
+
+            login_button = page.ele(
+                'xpath://*[@id="layers"]/div/div/div/div/div/div/div[2]/div[2]/div/div/div[2]/div[2]/div[2]/div/div[1]/div/div/button')
+
+            login_button.wait.clickable()
+            login_button.click()
+
+        all_hots = None
+        max_outer_retries = 3
+        outer_retry_count = 0
+        while not self.loop_event.is_set():
+            try:
+                all_hots = page.ele(
+                    'xpath://*[@id="react-root"]/div/div/div[2]/main/div/div/div/div/div/div[3]/section/div/div')
+                success = False
+                while not success:
+                    try:
+                        for child in all_hots.children()[:5]:
+                            status_href = child.eles("tag:a")[3]
+                            href = status_href.attr('href')
+
+                            if href in seen_hrefs:
+                                continue  # 如果链接已经处理过，跳过
+
+                            tweet_info = child.text.split('\n')
+                            vl = ""
+                            if len(tweet_info) > 5:
+                                vl = child.ele('xpath:div/div/article/div/div/div[2]/div[2]/div[3]/div/div').attr(
+                                    'aria-label')
+
+                            retry_count = 0
+                            max_retries = 3
+                            follower_num = None
+                            tab = None
+                            while retry_count < max_retries:
+                                try:
+                                    tab = page.new_tab('https://twitter.com/' + tweet_info[1])
+                                    follower_num = tab.ele(
+                                        'xpath://*[@id="react-root"]/div/div/div[2]/main/div/div/div/div/div/div[3]/div/div/div/div/div[5]/div[2]').raw_text
+                                    break
+                                except Exception as e:
+                                    print(f"尝试获取数据时出错，错误信息：{e}")
+                                    if tab:
+                                        tab.close()
+                                    retry_count += 1
+                                    if retry_count >= max_retries:
+                                        print(f"重试{max_retries}次后仍失败，跳过当前链接。")
+                                        break
+                                finally:
+                                    if tab:
+                                        tab.close()
+
+                            if self.process_follower_num(follower_num):
+                                continue
+
+                            formatted_str = f"""推文链接: {href}
+                                                {tweet_info[1]} | {tweet_info[3]}
+                                                由gpt-4-turbo翻译:
+                                                {tweet_info[4]}
+                                                {vl}
+                                                {follower_num}"""
+
+                            seen_hrefs.add(href)  # 记录已处理的链接
+                            repl = Bridge().fetch_reply_content(
+                                formatted_str + "/n将上面合适的内容翻译为中文,要保证完整性，排版也要很优雅。", None)
+                            itchat.send(repl.content, toUserName=receiver)
+                            page.scroll.down(500)
+
+                        success = True  # 成功完成for循环
+
+                    except Exception as e:
+                        print(f"循环执行过程中出错，错误信息：{e}")
+                        time.sleep(10)  # 等待30秒后重试
+                        success = False  # 确保能够重新进入循环
+
+                page.refresh()
+                page.wait(10)
+
+            except Exception as e:
+                outer_retry_count += 1
+                if outer_retry_count >= max_outer_retries:
+                    print(f"尝试{max_outer_retries}次后仍然失败，将停止尝试。")
+                    break
+                print(f"获取页面元素失败，错误信息：{e}，将在30秒后重试。")
+                time.sleep(30)
+
     # 统一的发送函数，每个Channel自行实现，根据reply的type字段发送不同类型的消息
     def send(self, reply: Reply, context: Context):
         receiver = context["receiver"]
         if reply.type == ReplyType.TEXT:
-            itchat.send(reply.content, toUserName=receiver)
+            command_str = reply.content.replace("@azuoy", "").replace("\n", "")
+            if command_str.startswith("x:"):
+                commands = command_str.split(":")
+                if "start" == commands[1]:
+                    self.loop_event.clear()  # 继续循环
+                    threading.Thread(target=self.start_sending, args=(commands[2], receiver)).start()
+                elif "stop" == commands[1]:
+                    self.loop_event.set()  # 停止循环
+            else:
+                itchat.send(reply.content, toUserName=receiver)
             logger.info("[WX] sendMsg={}, receiver={}".format(reply, receiver))
         elif reply.type == ReplyType.ERROR or reply.type == ReplyType.INFO:
             itchat.send(reply.content, toUserName=receiver)
@@ -258,6 +420,7 @@ class WechatChannel(ChatChannel):
             itchat.send_video(video_storage, toUserName=receiver)
             logger.info("[WX] sendVideo url={}, receiver={}".format(video_url, receiver))
 
+
 def _send_login_success():
     try:
         from common.linkai_client import chat_client
@@ -266,6 +429,7 @@ def _send_login_success():
     except Exception as e:
         pass
 
+
 def _send_logout():
     try:
         from common.linkai_client import chat_client
@@ -273,6 +437,7 @@ def _send_logout():
             chat_client.send_logout()
     except Exception as e:
         pass
+
 
 def _send_qr_code(qrcode_list: list):
     try:
